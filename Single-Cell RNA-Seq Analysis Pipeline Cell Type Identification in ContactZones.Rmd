@@ -1,0 +1,241 @@
+---
+title: "Single-Cell RNA-Seq Analysis Pipeline: Cell Type Identification in Contact Zones"
+format: 
+  html:
+    html-table-processing: none
+    page-layout: full
+    code-fold: true
+    toc: true
+    toc-depth: 3
+    toc-expand: 2
+    toc-location: left
+    smooth-scroll: true
+editor: source
+editor_options: 
+  chunk_output_type: console
+execute:
+  error: true
+  warning: false
+  eval: true
+---
+
+# I. Package Installation
+
+```{r}
+#| label: load packages
+#| include: false
+
+# CRAN packages
+if (!require("tidyverse", quietly = TRUE)) install.packages("tidyverse")
+if (!require("Seurat", quietly = TRUE)) install.packages("Seurat")
+if (!require("patchwork", quietly = TRUE)) install.packages("patchwork")
+if (!require("devtools", quietly = TRUE)) install.packages("devtools")
+
+# Bioconductor packages
+if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!require("scDblFinder", quietly = TRUE)) BiocManager::install("scDblFinder")
+if (!require("clusterProfiler", quietly = TRUE)) BiocManager::install("clusterProfiler")
+if (!require("org.Mm.eg.db", quietly = TRUE)) BiocManager::install("org.Mm.eg.db")
+if (!require("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db")
+if (!require("msigdbr", quietly = TRUE)) BiocManager::install("msigdbr")
+if (!require("enrichplot", quietly = TRUE)) BiocManager::install("enrichplot")
+if (!require("glmGamPoi", quietly = TRUE)) BiocManager::install("glmGamPoi")
+if (!require("ComplexHeatmap", quietly = TRUE)) BiocManager::install("ComplexHeatmap")
+
+# Load all packages
+library(tidyverse)
+library(Seurat)
+library(patchwork)
+library(scDblFinder)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(enrichplot)
+library(glmGamPoi)
+library(ComplexHeatmap)
+
+# Set global options
+options(stringsAsFactors = FALSE)
+options(future.globals.maxSize = 100000 * 1024^2)  # 100GB memory limit
+```
+
+## II. Data Loading & Initial Processing
+
+```{r}
+#| include: FALSE
+
+# Create Seurat objects and add group metadata
+ContactZone<- Read10X("ContactZone")
+ContactZone <- CreateSeuratObject(counts = ContactZone)
+ContactZone[['group']] <- "ContactZone"
+
+NonContactZone <- Read10X("NonContactZone")
+NonContactZone <- CreateSeuratObject(counts = NonContactZone)
+NonContactZone[['group']] <- "NonContactZone"
+
+# Merge datasets into a single Seurat object
+cells <- merge(ContactZone, NonContactZone)
+cells$group <- factor(cells$group, levels = c("ContactZone", "NonContactZone"))
+
+# Calculate mitochondrial gene percentage using mitochondrial gene markers
+cells[["percent.mt"]] <- PercentageFeatureSet(cells, pattern = "ND1|ND2|COX1|COX2|ATP8|ATP6|COX3|ND3|ND4L|ND4|ND5|ND6|CYTB")
+
+# Visualize quality control metrics
+VlnPlot(cells, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), group.by = "group",pt.size = 0)
+
+# Filter cells
+cells <- subset(cells, subset = nFeature_RNA > 200 & nFeature_RNA < 6500 & percent.mt < 10)
+```
+
+## III. Normalization & Integration
+
+```{r}
+#| warning: false
+#| message: false
+
+# Perform SCTransform normalization
+set.seed(123)
+cells <- SCTransform(cells, verbose = FALSE)
+cells <- RunPCA(cells, npcs = 30, verbose = FALSE)
+cells <- FindNeighbors(cells, dims = 1:30)
+cells <- FindClusters(cells, resolution = 0.3)
+
+# Integrate Sample to remove batch effects
+set.seed(123)
+cells <- IntegrateLayers(object = cells,method = RPCAIntegration,normalization.method = 'SCT',verbose = FALSE)
+
+# Re-cluster cells after integration
+cells <- FindNeighbors(cells, reduction = "integrated.dr", dims = 1:30)
+cells <- FindClusters(cells, resolution = 0.3)
+cells <- PrepSCTFindMarkers(cells)
+```
+
+## IV Detect doublets
+
+```{r}
+#| warning: false
+#| message: false
+
+# Detect doublets using scDblFinder
+set.seed(123)
+sce <- as.SingleCellExperiment(cells)
+sce <- scDblFinder(sce,dbr=0.1, samples = "group")
+
+# Extract doublet classification results
+meta_scdblfinder <- sce@colData@listData %>% as.data.frame() %>% dplyr::select(starts_with('scDblFinder')) # 'scDblFinder.class'
+rownames(meta_scdblfinder) <- sce@colData@rownames
+
+# Add doublet classification to Seurat object metadata
+cells <- AddMetaData(object = cells, metadata = meta_scdblfinder %>% dplyr::select('scDblFinder.class'))
+
+# Examine doublet classification distribution across groups
+table(cells$group, cells$scDblFinder.class)
+
+# Remove doublets and retain only singlets
+cells<- subset(cells, scDblFinder.class == "singlet")
+```
+
+## V. Re-integration & Clustering
+
+```{r}
+#| warning: false
+#| message: false
+
+# Split data by group for re-normalization after doublet removal
+cells[["RNA"]] <- split(cells[["RNA"]], f = cells$group, verbose = FALSE)
+
+# Re-apply SCTransform normalization to singlet cells
+cells <- SCTransform(cells, verbose = FALSE) 
+
+# Perform PCA on normalized data
+cells <- RunPCA(cells, npcs = 30, verbose = FALSE)
+
+# Re-integrate samples to ensure batch effect correction
+set.seed(123)
+cells <- IntegrateLayers(object = cells,method = RPCAIntegration,normalization.method = 'SCT',verbose = FALSE)
+
+# Cluster analysis
+set.seed(123)
+cells <- FindNeighbors(cells, reduction = "integrated.dr", dims = 1:30)
+cells <- FindClusters(cells, resolution = 0.3)
+
+# Non-linear dimensionality reduction using UMAP for visualization
+set.seed(123)
+cells <- RunUMAP(cells, dims = 1:30, reduction = "integrated.dr")
+DimPlot(cells, reduction = "umap",label = TRUE)
+DimPlot(cells, reduction = "umap", group.by = "group")
+```
+
+## VI. Marker Gene Identification
+
+```{r}
+#| warning: false
+#| message: false
+
+# Prepare for differential expression analysis
+cells <- PrepSCTFindMarkers(cells)
+
+# Identify cluster-specific marker genes
+markers <- FindAllMarkers(cells)
+write.csv(markers, "marker.csv")
+
+# Set cluster identities for downstream analysis
+Idents(cells) <- cells$SCT_snn_res.0.3 
+
+# Validate cell type identities using canonical marker genes
+
+# Myofibroblast c0
+# SMC C5,c8
+# Fibroblast c2
+VlnPlot(cells, features = c("MYH11","TAGLN","COL1A1","DCN"), pt.size = 0) 
+
+# Endothelial cell c1,9,11
+VlnPlot(cells, features = c("PECAM1","PTPRC","PDGFRA"), pt.size = 0)
+
+# T cell  c4,c10
+VlnPlot(cells, features = c("CD3D","CD2"), pt.size = 0) 
+
+# macrophage  c6,13
+VlnPlot(cells, features = c("CSF1R","CD163","C1QA"), pt.size = 0) 
+
+# Neutrophil c3,7,12
+VlnPlot(cells, features = c("FCGR3B","ITGAM","SELL","IL1R2","CEACAM8","CXCR2"), pt.size = 0)
+
+# Mast cell  c15
+VlnPlot(cells, features = "KIT",pt.size = 0) 
+
+# Schwann cell c14
+VlnPlot(cells, features = "MPZ", pt.size = 0) 
+```
+
+
+## VII. Cell Type Annotation
+
+```{r}
+#| warning: false
+#| message: false
+
+# Load cell type annotations from  above analysis
+celltype <- readxl::read_excel("celltype1.xlsx")
+new_cluster_id <- celltype$celltype
+names(new_cluster_id) <- levels(cells)
+
+# Apply cell type annotations to clusters
+cells_named <- RenameIdents(cells, new_cluster_id)
+cells_named[["res03_cluster"]] <- Idents(cells_named)
+
+# Generate cell type distribution table across experimental groups
+table(cells_named@meta.data$res03_cluster,cells_named@meta.data$group)
+
+
+
+
+```
+
+## VIII. Session info
+```{r}
+#| label: Session info
+#| eval: true
+sessionInfo()
+```

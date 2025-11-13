@@ -41,13 +41,13 @@ Important: Ensure your data file has the same column names and data types as [de
 3.	Open [your_script.R] in a text editor or RStudio.
 4.	Locate the line of code (around line [XX]) that reads the data:
 R
-# data <- read.csv("[demo_data.csv]")
+data <- read.csv("[demo_data.csv]")
 5.	Modify it to point to your new file:
 R
 data <- read.csv("my_data.csv")
 6.	(If needed) Adjust other parameters, such as the output file name:
 R
-# ggsave("[output_plot.png]")
+ggsave("[output_plot.png]")
 ggsave("my_custom_plot.png")
 7.	Run the script again as described in the "3. Demo" section.
 
@@ -56,7 +56,7 @@ ggsave("my_custom_plot.png")
 ## Installation
 This analysis pipeline requires the following R packages:
 ```{r cars}
-# CRAN packages
+CRAN packages
 install.packages(c("tidyverse", "Seurat", "patchwork", "devtools"))
 
 # Bioconductor packages
